@@ -1772,6 +1772,15 @@ status_t Camera3Device::waitUntilDrainedLocked(nsecs_t maxExpectedDuration) {
     if (res != OK) {
         SET_ERR_L("Error waiting for HAL to drain: %s (%d)", strerror(-res),
                 res);
+        if (res == TIMED_OUT) {
+            for (size_t i = 0; i < mInFlightMap.size(); i++) {
+                InFlightRequest r = mInFlightMap.valueAt(i);
+                ALOGE("%s: Timed out Frame %d Timestamp: %" PRId64 ",  metadata"
+                    " arrived: %s, buffers left: %d\n", __FUNCTION__, mInFlightMap.keyAt(i),
+                        r.shutterTimestamp, r.haveResultMetadata ? "true" : "false",
+                        r.numBuffersLeft);
+            }
+        }
     }
     return res;
 }
@@ -3999,9 +4008,15 @@ status_t Camera3Device::RequestThread::clear(
 
 status_t Camera3Device::RequestThread::flush() {
     ATRACE_CALL();
+    status_t flush_status;
     Mutex::Autolock l(mFlushLock);
 
-    return mInterface->flush();
+    flush_status = mInterface->flush();
+    // We have completed flush, signal RequestThread::waitForNextRequestLocked() to no longer wait for
+    // new requests
+    mRequestSignal.signal();
+
+    return flush_status;
 }
 
 void Camera3Device::RequestThread::setPaused(bool paused) {
@@ -4677,15 +4692,21 @@ status_t Camera3Device::RequestThread::prepareHalRequests() {
         }
         bool isStillCapture = false;
         bool isZslCapture = false;
+        const camera_metadata_t* settings = halRequest->settings;
+        bool shouldUnlockSettings = false;
+        if (settings == nullptr) {
+            shouldUnlockSettings = true;
+            settings = captureRequest->mSettingsList.begin()->metadata.getAndLock();
+        }
         if (!mNextRequests[0].captureRequest->mSettingsList.begin()->metadata.isEmpty()) {
             camera_metadata_ro_entry_t e = camera_metadata_ro_entry_t();
-            find_camera_metadata_ro_entry(halRequest->settings, ANDROID_CONTROL_CAPTURE_INTENT, &e);
+            find_camera_metadata_ro_entry(settings, ANDROID_CONTROL_CAPTURE_INTENT, &e);
             if ((e.count > 0) && (e.data.u8[0] == ANDROID_CONTROL_CAPTURE_INTENT_STILL_CAPTURE)) {
                 isStillCapture = true;
                 ATRACE_ASYNC_BEGIN("still capture", mNextRequests[i].halRequest.frame_number);
             }
 
-            find_camera_metadata_ro_entry(halRequest->settings, ANDROID_CONTROL_ENABLE_ZSL, &e);
+            find_camera_metadata_ro_entry(settings, ANDROID_CONTROL_ENABLE_ZSL, &e);
             if ((e.count > 0) && (e.data.u8[0] == ANDROID_CONTROL_ENABLE_ZSL_TRUE)) {
                 isZslCapture = true;
             }
@@ -4694,7 +4715,7 @@ status_t Camera3Device::RequestThread::prepareHalRequests() {
                 totalNumBuffers, captureRequest->mResultExtras,
                 /*hasInput*/halRequest->input_buffer != NULL,
                 hasCallback,
-                calculateMaxExpectedDuration(halRequest->settings),
+                calculateMaxExpectedDuration(settings),
                 requestedPhysicalCameras, isStillCapture, isZslCapture,
                 captureRequest->mRotateAndCropAuto, mPrevCameraIdsWithZoom,
                 (mUseHalBufManager) ? uniqueSurfaceIdMap :
@@ -4704,6 +4725,11 @@ status_t Camera3Device::RequestThread::prepareHalRequests() {
                 __FUNCTION__,
                 captureRequest->mResultExtras.requestId, captureRequest->mResultExtras.frameNumber,
                 captureRequest->mResultExtras.burstId);
+
+        if (shouldUnlockSettings) {
+            captureRequest->mSettingsList.begin()->metadata.unlock(settings);
+        }
+
         if (res != OK) {
             SET_ERR("RequestThread: Unable to register new in-flight request:"
                     " %s (%d)", strerror(-res), res);
