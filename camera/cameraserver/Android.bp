@@ -22,7 +22,7 @@ cc_binary {
     ],
 
     shared_libs: [
-        "//frameworks/av/services/camera/libcameraservice:libcameraservice",
+        "libcameraservice",
         "liblog",
         "libutils",
         "libui",

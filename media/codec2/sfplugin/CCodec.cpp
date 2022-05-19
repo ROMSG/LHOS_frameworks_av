@@ -248,19 +248,14 @@ public:
         }
 
         size_t numSlots = 16;
-        // WORKAROUND: having more slots improve performance while consuming
-        // more memory. This is a temporary workaround to reduce memory for
-        // larger-than-4K scenario.
-        if (mWidth * mHeight > 4096 * 2340) {
-            constexpr OMX_U32 kPortIndexInput = 0;
+        constexpr OMX_U32 kPortIndexInput = 0;
 
-            OMX_PARAM_PORTDEFINITIONTYPE param;
-            param.nPortIndex = kPortIndexInput;
-            status_t err = mNode->getParameter(OMX_IndexParamPortDefinition,
-                                               &param, sizeof(param));
-            if (err == OK) {
-                numSlots = param.nBufferCountActual;
-            }
+        OMX_PARAM_PORTDEFINITIONTYPE param;
+        param.nPortIndex = kPortIndexInput;
+        status_t err = mNode->getParameter(OMX_IndexParamPortDefinition,
+                                           &param, sizeof(param));
+        if (err == OK) {
+            numSlots = param.nBufferCountActual;
         }
 
         for (size_t i = 0; i < numSlots; ++i) {
@@ -1160,13 +1155,11 @@ void CCodec::createInputSurface() {
     status_t err;
     sp<IGraphicBufferProducer> bufferProducer;
 
-    sp<AMessage> inputFormat;
     sp<AMessage> outputFormat;
     uint64_t usage = 0;
     {
         Mutexed<std::unique_ptr<Config>>::Locked configLocked(mConfig);
         const std::unique_ptr<Config> &config = *configLocked;
-        inputFormat = config->mInputFormat;
         outputFormat = config->mOutputFormat;
         usage = config->mISConfig ? config->mISConfig->mUsage : 0;
     }
@@ -1202,6 +1195,14 @@ void CCodec::createInputSurface() {
         return;
     }
 
+    // Formats can change after setupInputSurface
+    sp<AMessage> inputFormat;
+    {
+        Mutexed<std::unique_ptr<Config>>::Locked configLocked(mConfig);
+        const std::unique_ptr<Config> &config = *configLocked;
+        inputFormat = config->mInputFormat;
+        outputFormat = config->mOutputFormat;
+    }
     mCallback->onInputSurfaceCreated(
             inputFormat,
             outputFormat,
@@ -1251,13 +1252,11 @@ void CCodec::initiateSetInputSurface(const sp<PersistentSurface> &surface) {
 }
 
 void CCodec::setInputSurface(const sp<PersistentSurface> &surface) {
-    sp<AMessage> inputFormat;
     sp<AMessage> outputFormat;
     uint64_t usage = 0;
     {
         Mutexed<std::unique_ptr<Config>>::Locked configLocked(mConfig);
         const std::unique_ptr<Config> &config = *configLocked;
-        inputFormat = config->mInputFormat;
         outputFormat = config->mOutputFormat;
         usage = config->mISConfig ? config->mISConfig->mUsage : 0;
     }
@@ -1288,6 +1287,14 @@ void CCodec::setInputSurface(const sp<PersistentSurface> &surface) {
         ALOGE("Failed to set input surface: Corrupted surface.");
         mCallback->onInputSurfaceDeclined(UNKNOWN_ERROR);
         return;
+    }
+    // Formats can change after setupInputSurface
+    sp<AMessage> inputFormat;
+    {
+        Mutexed<std::unique_ptr<Config>>::Locked configLocked(mConfig);
+        const std::unique_ptr<Config> &config = *configLocked;
+        inputFormat = config->mInputFormat;
+        outputFormat = config->mOutputFormat;
     }
     mCallback->onInputSurfaceAccepted(inputFormat, outputFormat);
 }
@@ -1712,6 +1719,39 @@ void CCodec::signalRequestIDRFrame() {
     config->setParameters(comp, params, C2_MAY_BLOCK);
 }
 
+status_t CCodec::querySupportedParameters(std::vector<std::string> *names) {
+    Mutexed<std::unique_ptr<Config>>::Locked configLocked(mConfig);
+    const std::unique_ptr<Config> &config = *configLocked;
+    return config->querySupportedParameters(names);
+}
+
+status_t CCodec::describeParameter(
+        const std::string &name, CodecParameterDescriptor *desc) {
+    Mutexed<std::unique_ptr<Config>>::Locked configLocked(mConfig);
+    const std::unique_ptr<Config> &config = *configLocked;
+    return config->describe(name, desc);
+}
+
+status_t CCodec::subscribeToParameters(const std::vector<std::string> &names) {
+    std::shared_ptr<Codec2Client::Component> comp = mState.lock()->comp;
+    if (!comp) {
+        return INVALID_OPERATION;
+    }
+    Mutexed<std::unique_ptr<Config>>::Locked configLocked(mConfig);
+    const std::unique_ptr<Config> &config = *configLocked;
+    return config->subscribeToVendorConfigUpdate(comp, names);
+}
+
+status_t CCodec::unsubscribeFromParameters(const std::vector<std::string> &names) {
+    std::shared_ptr<Codec2Client::Component> comp = mState.lock()->comp;
+    if (!comp) {
+        return INVALID_OPERATION;
+    }
+    Mutexed<std::unique_ptr<Config>>::Locked configLocked(mConfig);
+    const std::unique_ptr<Config> &config = *configLocked;
+    return config->unsubscribeFromVendorConfigUpdate(comp, names);
+}
+
 void CCodec::onWorkDone(std::list<std::unique_ptr<C2Work>> &workItems) {
     if (!workItems.empty()) {
         Mutexed<std::list<std::unique_ptr<C2Work>>>::Locked queue(mWorkDoneQueue);
@@ -1875,7 +1915,12 @@ void CCodec::onMessageReceived(const sp<AMessage> &msg) {
                 }
             }
             if (config->mInputSurface) {
-                config->mInputSurface->onInputBufferDone(work->input.ordinal.frameIndex);
+                if (work->worklets.empty()
+                       || !work->worklets.back()
+                       || (work->worklets.back()->output.flags
+                              & C2FrameData::FLAG_INCOMPLETE) == 0) {
+                    config->mInputSurface->onInputBufferDone(work->input.ordinal.frameIndex);
+                }
             }
             mChannel->onWorkDone(
                     std::move(work), changed ? config->mOutputFormat->dup() : nullptr,

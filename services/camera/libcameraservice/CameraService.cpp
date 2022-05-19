@@ -24,7 +24,7 @@
 #include <cstring>
 #include <ctime>
 #include <string>
-#ifdef TARGET_NEEDS_CLIENT_INFO
+#ifdef CAMERA_NEEDS_CLIENT_INFO
 #include <iostream>
 #include <fstream>
 #endif
@@ -81,6 +81,10 @@
 #include "utils/TagMonitor.h"
 #include "utils/CameraThreadState.h"
 
+#ifdef CAMERA_NEEDS_CLIENT_INFO_LIB
+#include <vendor/oneplus/hardware/camera/1.0/IOnePlusCameraProvider.h>
+#endif
+
 namespace {
     const char* kPermissionServiceName = "permission";
 }; // namespace anonymous
@@ -98,6 +102,9 @@ using hardware::camera::common::V1_0::CameraDeviceStatus;
 using hardware::camera::common::V1_0::TorchModeStatus;
 using hardware::camera2::utils::CameraIdAndSessionConfiguration;
 using hardware::camera2::utils::ConcurrentCameraIdCombination;
+#ifdef CAMERA_NEEDS_CLIENT_INFO_LIB
+using ::vendor::oneplus::hardware::camera::V1_0::IOnePlusCameraProvider;
+#endif
 
 // ----------------------------------------------------------------------------
 // Logging support -- this is for debugging only
@@ -132,6 +139,10 @@ static const String16
         sCameraSendSystemEventsPermission("android.permission.CAMERA_SEND_SYSTEM_EVENTS");
 static const String16 sCameraOpenCloseListenerPermission(
         "android.permission.CAMERA_OPEN_CLOSE_LISTENER");
+
+#ifdef CAMERA_NEEDS_CLIENT_INFO_LIB
+static const sp<IOnePlusCameraProvider> gVendorCameraProviderService = IOnePlusCameraProvider::getService();
+#endif
 
 // Matches with PERCEPTIBLE_APP_ADJ in ProcessList.java
 static constexpr int32_t kVendorClientScore = 200;
@@ -256,14 +267,8 @@ void CameraService::pingCameraServiceProxy() {
     proxyBinder->pingForUserUpdate();
 }
 
-void CameraService::broadcastTorchModeStatus(const String8& cameraId, TorchModeStatus status) {
-    SystemCameraKind systemCameraKind = SystemCameraKind::PUBLIC;
-    status_t res = getSystemCameraKind(cameraId, &systemCameraKind);
-    if (res != OK) {
-        ALOGE("%s: Could not get system camera kind for camera id %s", __FUNCTION__,
-                cameraId.string());
-        return;
-    }
+void CameraService::broadcastTorchModeStatus(const String8& cameraId, TorchModeStatus status,
+        SystemCameraKind systemCameraKind) {
     Mutex::Autolock lock(mStatusListenerLock);
     for (auto& i : mListenerList) {
         if (shouldSkipStatusUpdates(systemCameraKind, i->isVendorListener(), i->getListenerPid(),
@@ -357,7 +362,7 @@ void CameraService::addStates(const String8 id) {
         Mutex::Autolock al(mTorchStatusMutex);
         mTorchStatusMap.add(id, TorchModeStatus::AVAILABLE_OFF);
 
-        broadcastTorchModeStatus(id, TorchModeStatus::AVAILABLE_OFF);
+        broadcastTorchModeStatus(id, TorchModeStatus::AVAILABLE_OFF, deviceKind);
     }
 
     updateCameraNumAndIds();
@@ -518,12 +523,26 @@ void CameraService::disconnectClient(const String8& id, sp<BasicClient> clientTo
 
 void CameraService::onTorchStatusChanged(const String8& cameraId,
         TorchModeStatus newStatus) {
+    SystemCameraKind systemCameraKind = SystemCameraKind::PUBLIC;
+    status_t res = getSystemCameraKind(cameraId, &systemCameraKind);
+    if (res != OK) {
+        ALOGE("%s: Could not get system camera kind for camera id %s", __FUNCTION__,
+                cameraId.string());
+        return;
+    }
     Mutex::Autolock al(mTorchStatusMutex);
-    onTorchStatusChangedLocked(cameraId, newStatus);
+    onTorchStatusChangedLocked(cameraId, newStatus, systemCameraKind);
+}
+
+
+void CameraService::onTorchStatusChanged(const String8& cameraId,
+        TorchModeStatus newStatus, SystemCameraKind systemCameraKind) {
+    Mutex::Autolock al(mTorchStatusMutex);
+    onTorchStatusChangedLocked(cameraId, newStatus, systemCameraKind);
 }
 
 void CameraService::onTorchStatusChangedLocked(const String8& cameraId,
-        TorchModeStatus newStatus) {
+        TorchModeStatus newStatus, SystemCameraKind systemCameraKind) {
     ALOGI("%s: Torch status changed for cameraId=%s, newStatus=%d",
             __FUNCTION__, cameraId.string(), newStatus);
 
@@ -572,7 +591,7 @@ void CameraService::onTorchStatusChangedLocked(const String8& cameraId,
             }
         }
     }
-    broadcastTorchModeStatus(cameraId, newStatus);
+    broadcastTorchModeStatus(cameraId, newStatus, systemCameraKind);
 }
 
 static bool hasPermissionsForSystemCamera(int callingPid, int callingUid) {
@@ -1507,7 +1526,6 @@ Status CameraService::connect(
                 ret.toString8());
         return ret;
     }
-
     *device = client;
     return ret;
 }
@@ -2897,7 +2915,7 @@ String16 CameraService::BasicClient::getPackageName() const {
 
 bool CameraService::BasicClient::isFaceUnlockPackage() const {
     std::string cpn = String8(mClientPackageName).string();
-    return cpn.compare("com.android.faceunlock") == 0;
+    return cpn.compare("com.crdroid.faceunlock") == 0;
 }
 
 int CameraService::BasicClient::getClientPid() const {
@@ -2993,12 +3011,14 @@ status_t CameraService::BasicClient::startCameraOps() {
     // Notify listeners of camera open/close status
     sCameraService->updateOpenCloseStatus(mCameraIdStr, true/*open*/, mClientPackageName);
 
-#ifdef TARGET_NEEDS_CLIENT_INFO
-	std::ofstream cpf("/data/misc/evolution/client_package_name");
-	std::string cpn = String8(mClientPackageName).string();
+#ifdef CAMERA_NEEDS_CLIENT_INFO
+    std::ofstream cpf("/data/misc/lineage/client_package_name");
+    std::string cpn = String8(mClientPackageName).string();
     cpf << cpn;
 #endif
-
+#ifdef CAMERA_NEEDS_CLIENT_INFO_LIB
+    gVendorCameraProviderService->setPackageName(String8(mClientPackageName).string());
+#endif
     return OK;
 }
 
@@ -3819,7 +3839,7 @@ void CameraService::updateStatus(StatusInternal status, const String8& cameraId,
                             TorchModeStatus::AVAILABLE_OFF :
                             TorchModeStatus::NOT_AVAILABLE;
                     if (torchStatus != newTorchStatus) {
-                        onTorchStatusChangedLocked(cameraId, newTorchStatus);
+                        onTorchStatusChangedLocked(cameraId, newTorchStatus, deviceKind);
                     }
                 }
             }
